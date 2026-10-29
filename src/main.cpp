@@ -8,6 +8,8 @@
 #include "GroceryManager.h"
 #include "NetworkManager.h"
 #include "Meals.h"
+#include "ApiManager.h"
+#include <LittleFS.h>
 
 // ============================================================
 // MaTouch Lite ESP32-S3 3.95" ST7796 - FRIDGE GROCERY STOCK APP
@@ -52,6 +54,9 @@ NS2009 touch(TOUCH_I2C_ADDRESS, false, false);
 GroceryManager groceryManager;
 NetworkManager networkManager;
 MealsManager mealsManager;
+// Instantiate server passing existing managers
+ApiServer apiServer(groceryManager, mealsManager);
+bool apiServerStarted = false;
 
 unsigned long lastWifiRetryMillis = 0;
 const unsigned long WIFI_RETRY_INTERVAL_MS = 5UL * 60UL * 1000UL;
@@ -60,6 +65,10 @@ char pendingSSID[33] = "";
 // ============================================================
 // APP STATE
 // ============================================================
+
+// --- SCREEN REFRESH TIMER ---
+unsigned long lastScreenRefreshMillis = 0;
+const unsigned long SCREEN_REFRESH_INTERVAL_MS = 30000; // Refresh interval (e.g. every 10 seconds)
 
 AppScreen currentScreen = SCREEN_DASHBOARD;
 bool menuOpen = false;
@@ -90,6 +99,15 @@ const unsigned long SPOIL_CHECK_INTERVAL_MS = 60UL * 60UL * 1000UL;
 int mealScrollOffset = 0;
 int lastTouchY = 0;
 
+// --- PAGING STATE FOR THE DASHBOARD INVENTORY ---
+// Six grocery items fit cleanly above the bottom navigation controls.
+#define DASHBOARD_ITEMS_PER_PAGE 6
+int dashboardPageIndex = 0;
+
+// --- PAGING STATE FOR THE MEALS LIST (3 meals shown per page) ---
+#define MEALS_PER_PAGE 3
+int mealsPageIndex = 0;
+
 // Meal Details uses the original scroll area.
 // Add Meal has a different layout because Name + Category occupy the top.
 #define MEAL_DETAILS_SCROLL_TOP    (HEADER_H + 85)
@@ -115,7 +133,7 @@ const Button homeButton = {SCREEN_W - 85, 0, 30, HEADER_H, ""};
 Button menuButtons[4] = {
     {MENU_BTN_X, 0, MENU_BTN_W, MENU_BTN_H, "Add Item"},
     {MENU_BTN_X, 0, MENU_BTN_W, MENU_BTN_H, "Edit Stock"},
-    {MENU_BTN_X, 0, MENU_BTN_W, MENU_BTN_H, "Fetch Updates"},
+    {MENU_BTN_X, 0, MENU_BTN_W, MENU_BTN_H, "Calendar"},
     {MENU_BTN_X, 0, MENU_BTN_W, MENU_BTN_H, "Meals"},
 };
 
@@ -162,6 +180,18 @@ const Button addIngredientBtn = {400, 160, 26, 26, "+"};
 Button mealListButtons[MAX_MEALS];
 Button mealAddBtn = {400, HEADER_H + 35, 26, 26, "+"};
 const Button mealMinusBtn = {440, HEADER_H + 35, 26, 26, "-"};
+const Button mealDeleteBtn = {380, SCREEN_H - 60, 80, 40, "Del"};
+
+// Pagination controls for the dashboard inventory - bottom-right,
+// in-line with the same navigation area used by the Meals screen.
+const Button dashboardPrevPageBtn = {330, SCREEN_H - 60, 40, 40, "<"};
+const Button dashboardNextPageBtn = {420, SCREEN_H - 60, 40, 40, ">"};
+
+// Pagination controls for the meals list - sit bottom-right, in-line with
+// the Back button (same y/height), mirroring its left-side margin.
+const Button mealsPrevPageBtn = {330, SCREEN_H - 60, 40, 40, "<"};
+const Button mealsNextPageBtn = {420, SCREEN_H - 60, 40, 40, ">"};
+
 
 // ============================================================
 // FORWARD DECLARATIONS
@@ -192,6 +222,7 @@ void drawMealsScreen();
 void drawMealDetailsScreen();
 void drawAddMealScreen();
 void drawHomeButton();
+void refreshCurrentScreen();
 
 
 // ============================================================
@@ -203,6 +234,366 @@ uint16_t daysColor(int daysLeft, bool spoiled)
     if (spoiled) return TFT_RED;
     if (daysLeft <= 2) return TFT_ORANGE;
     return TFT_GREEN;
+}
+
+
+// ============================================================
+// CALENDAR: MEAL PLANNER
+// ============================================================
+
+#define CAL_MAX_ENTRIES   120
+#define CAL_FILE_PATH     "/calendar.bin"
+
+#define CAL_GRID_X        12
+#define CAL_GRID_Y        92
+#define CAL_CELL_W        65
+#define CAL_CELL_H        36
+
+#define CAL_DAY_LIST_TOP    115
+#define CAL_DAY_LIST_BOTTOM 255
+#define CAL_DAY_ROW_H       22
+
+// One meal assigned to one calendar day. The meal is stored by NAME (not
+// index) so deleting other meals never shifts assignments onto the wrong day.
+struct CalendarEntry {
+    uint16_t year;
+    uint8_t  month;   // 0-11
+    uint8_t  day;     // 1-31
+    char     meal[MEAL_NAME_MAX_LEN];
+};
+
+CalendarEntry calEntries[CAL_MAX_ENTRIES];
+int calEntryCount = 0;
+
+int calViewYear  = 2026;
+int calViewMonth = 0;      // month currently shown in the grid (0-11)
+
+int calSelYear   = 2026;   // day currently open on the day screen
+int calSelMonth  = 0;
+int calSelDay    = 1;
+int calPickedMeal = -1;    // index into mealsManager, -1 = no meal
+bool calOrphan   = false;  // day had a meal that no longer exists
+
+const char *calMonthNames[12] = {
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December"
+};
+const char *calDayLabels[7] = {"Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"};
+
+const Button calPrevBtn     = {10,  44, 50, 28, "<"};
+const Button calNextBtn     = {420, 44, 50, 28, ">"};
+const Button calMealPrevBtn = {20,  48, 40, 36, "<"};
+const Button calMealNextBtn = {420, 48, 40, 36, ">"};
+
+// --- date helpers (no timezone dependence) ---
+
+bool calIsLeap(int y)
+{
+    return (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
+}
+
+int calDaysInMonth(int y, int m0)
+{
+    static const int dim[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    if (m0 == 1 && calIsLeap(y)) return 29;
+    return dim[m0];
+}
+
+// 0 = Sunday ... 6 = Saturday (Sakamoto's algorithm). m0 is 0-11.
+int calDayOfWeek(int y, int m0, int d)
+{
+    static const int t[12] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
+    if (m0 < 2) y -= 1;
+    return (y + y / 4 - y / 100 + y / 400 + t[m0] + d) % 7;
+}
+
+void calGetToday(int &y, int &m0, int &d)
+{
+    time_t now = time(nullptr);
+    struct tm t;
+    localtime_r(&now, &t);
+    y  = t.tm_year + 1900;
+    m0 = t.tm_mon;
+    d  = t.tm_mday;
+}
+
+// --- storage ---
+
+void calSave()
+{
+    if (LittleFS.exists(CAL_FILE_PATH)) LittleFS.remove(CAL_FILE_PATH);
+
+    fs::File f = LittleFS.open(CAL_FILE_PATH, "w");
+    if (!f) {
+        Serial.println("ERROR: could not open calendar file for writing.");
+        return;
+    }
+
+    f.write((uint8_t *)&calEntryCount, sizeof(calEntryCount));
+    f.write((uint8_t *)calEntries, sizeof(CalendarEntry) * calEntryCount);
+    f.flush();
+    f.close();
+}
+
+void calLoad()
+{
+    calEntryCount = 0;
+
+    fs::File f = LittleFS.open(CAL_FILE_PATH, "r");
+    if (!f) {
+        Serial.println("No calendar file yet - starting empty.");
+        return;
+    }
+
+    int count = 0;
+    if (f.read((uint8_t *)&count, sizeof(count)) != sizeof(count) ||
+        count < 0 || count > CAL_MAX_ENTRIES) {
+        Serial.println("Calendar file looked corrupt - ignoring.");
+        f.close();
+        return;
+    }
+
+    size_t expected = sizeof(CalendarEntry) * count;
+    size_t got = f.read((uint8_t *)calEntries, expected);
+    f.close();
+
+    if (got == expected) {
+        calEntryCount = count;
+        Serial.printf("Loaded %d calendar entr(ies) from flash.\n", calEntryCount);
+    } else {
+        Serial.println("Calendar file size mismatch - ignoring.");
+    }
+}
+
+int calFind(int y, int m0, int d)
+{
+    for (int i = 0; i < calEntryCount; i++) {
+        if (calEntries[i].year == y && calEntries[i].month == m0 && calEntries[i].day == d) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// Assign a meal to a day. A null/empty mealName clears the day.
+void calAssign(int y, int m0, int d, const char *mealName)
+{
+    int idx = calFind(y, m0, d);
+    bool clear = (mealName == nullptr || mealName[0] == '\0');
+
+    if (clear) {
+        if (idx < 0) return;
+        for (int j = idx; j < calEntryCount - 1; j++) calEntries[j] = calEntries[j + 1];
+        calEntryCount--;
+        calSave();
+        return;
+    }
+
+    if (idx < 0) {
+        if (calEntryCount >= CAL_MAX_ENTRIES) {
+            Serial.println("Calendar full - cannot assign more days.");
+            return;
+        }
+        idx = calEntryCount++;
+        calEntries[idx].year  = y;
+        calEntries[idx].month = m0;
+        calEntries[idx].day   = d;
+    }
+
+    strncpy(calEntries[idx].meal, mealName, MEAL_NAME_MAX_LEN - 1);
+    calEntries[idx].meal[MEAL_NAME_MAX_LEN - 1] = '\0';
+    calSave();
+}
+
+int calMealIndexByName(const char *name)
+{
+    for (int i = 0; i < mealsManager.getMealCount(); i++) {
+        if (strcasecmp(mealsManager.getMeals()[i].name, name) == 0) return i;
+    }
+    return -1;
+}
+
+// An ingredient counts as "in stock" if a matching, unspoiled item with
+// quantity > 0 exists (case-insensitive exact name match).
+bool calIngredientInStock(const char *ingredient)
+{
+    for (int i = 0; i < groceryManager.getItemCount(); i++) {
+        const auto &it = groceryManager.getItems()[i];
+        if (strcasecmp(it.name, ingredient) == 0 && it.qty > 0 && !it.spoiled) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void calOpenDay(int y, int m0, int d)
+{
+    calSelYear  = y;
+    calSelMonth = m0;
+    calSelDay   = d;
+    calPickedMeal = -1;
+    calOrphan = false;
+    mealScrollOffset = 0;
+
+    int e = calFind(y, m0, d);
+    if (e >= 0) {
+        calPickedMeal = calMealIndexByName(calEntries[e].meal);
+        if (calPickedMeal < 0) calOrphan = true;
+    }
+}
+
+// --- drawing ---
+
+void calDrawArrowBtn(const Button &b, bool filled = true)
+{
+    tft.fillRoundRect(b.x, b.y, b.w, b.h, 6, TFT_DARKCYAN);
+    tft.drawRoundRect(b.x, b.y, b.w, b.h, 6, TFT_WHITE);
+    tft.setTextColor(TFT_WHITE, TFT_DARKCYAN);
+    tft.setTextSize(2);
+    tft.setCursor(b.x + (b.w - 12) / 2, b.y + (b.h - 16) / 2);
+    tft.print(b.label);
+}
+
+void drawCalendarScreen()
+{
+    tft.fillScreen(TFT_BLACK);
+    drawHeader("Calendar");
+
+    int todayY, todayM, todayD;
+    calGetToday(todayY, todayM, todayD);
+
+    // Month navigation row
+    calDrawArrowBtn(calPrevBtn);
+    calDrawArrowBtn(calNextBtn);
+
+    char title[24];
+    snprintf(title, sizeof(title), "%s %d", calMonthNames[calViewMonth], calViewYear);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setTextSize(2);
+    tft.setCursor((SCREEN_W - (int)strlen(title) * 12) / 2, 51);
+    tft.print(title);
+
+    // Weekday labels
+    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    for (int c = 0; c < 7; c++) {
+        tft.setCursor(CAL_GRID_X + c * CAL_CELL_W + 20, 75);
+        tft.print(calDayLabels[c]);
+    }
+
+    // Day cells
+    int firstDow = calDayOfWeek(calViewYear, calViewMonth, 1);
+    int dim = calDaysInMonth(calViewYear, calViewMonth);
+
+    for (int day = 1; day <= dim; day++) {
+        int slot = firstDow + day - 1;
+        int col = slot % 7;
+        int row = slot / 7;
+
+        int cx = CAL_GRID_X + col * CAL_CELL_W;
+        int cy = CAL_GRID_Y + row * CAL_CELL_H;
+        int cw = CAL_CELL_W - 2;
+        int ch = CAL_CELL_H - 2;
+
+        bool hasMeal = calFind(calViewYear, calViewMonth, day) >= 0;
+        bool isToday = (calViewYear == todayY && calViewMonth == todayM && day == todayD);
+
+        if (hasMeal) {
+            // Green outline (2px) for days with a meal
+            tft.drawRect(cx, cy, cw, ch, TFT_GREEN);
+            tft.drawRect(cx + 1, cy + 1, cw - 2, ch - 2, TFT_GREEN);
+        } else {
+            tft.drawRect(cx, cy, cw, ch, TFT_DARKGREY);
+        }
+
+        tft.setTextColor(isToday ? TFT_YELLOW : TFT_WHITE, TFT_BLACK);
+        tft.setTextSize(2);
+        tft.setCursor(cx + 7, cy + 9);
+        tft.print(day);
+    }
+}
+
+void drawCalendarDayScreen()
+{
+    tft.fillScreen(TFT_BLACK);
+
+    char title[28];
+    snprintf(title, sizeof(title), "%s %d, %d",
+             calMonthNames[calSelMonth], calSelDay, calSelYear);
+    drawHeader(title);
+
+    int mealCount = mealsManager.getMealCount();
+    if (calPickedMeal >= mealCount) calPickedMeal = -1;
+
+    // Meal selector:  [<]  meal name  [>]
+    calDrawArrowBtn(calMealPrevBtn);
+    calDrawArrowBtn(calMealNextBtn);
+
+    tft.fillRoundRect(65, 48, 350, 36, 6, TFT_DARKCYAN);
+    tft.drawRoundRect(65, 48, 350, 36, 6, TFT_WHITE);
+    tft.setTextColor(TFT_WHITE, TFT_DARKCYAN);
+    tft.setTextSize(2);
+    tft.setCursor(75, 58);
+
+    char nameBuf[32];
+    if (calPickedMeal >= 0) {
+        snprintf(nameBuf, sizeof(nameBuf), "%.28s", mealsManager.getMeals()[calPickedMeal].name);
+    } else {
+        snprintf(nameBuf, sizeof(nameBuf), "%s", mealCount > 0 ? "No meal (tap arrows)" : "No meals created");
+    }
+    tft.print(nameBuf);
+
+    // Ingredients
+    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    tft.setCursor(20, 94);
+
+    if (calPickedMeal >= 0) {
+        tft.print("Ingredients (red = not in stock)");
+
+        const MealItem &meal = mealsManager.getMeals()[calPickedMeal];
+
+        for (int i = 0; i < meal.ingredientCount && i < MAX_INGREDIENTS; i++) {
+            int yPos = CAL_DAY_LIST_TOP + (i * CAL_DAY_ROW_H) - mealScrollOffset;
+
+            if (yPos < CAL_DAY_LIST_TOP) continue;
+            if (yPos + 20 > CAL_DAY_LIST_BOTTOM) break;
+
+            bool inStock = calIngredientInStock(meal.ingredients[i]);
+
+            tft.fillRect(30, yPos + 2, SCREEN_W - 60, 18, TFT_DARKGREY);
+            tft.drawRect(30, yPos, SCREEN_W - 60, 20, TFT_WHITE);
+
+            char temp[INGREDIENT_NAME_MAX_LEN];
+            strncpy(temp, meal.ingredients[i], INGREDIENT_NAME_MAX_LEN - 1);
+            temp[INGREDIENT_NAME_MAX_LEN - 1] = '\0';
+
+            tft.setTextColor(inStock ? TFT_WHITE : TFT_RED, TFT_DARKGREY);
+            tft.setCursor(38, yPos + 3);
+            tft.print(temp);
+        }
+
+        if (meal.ingredientCount == 0) {
+            tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+            tft.setCursor(30, CAL_DAY_LIST_TOP + 4);
+            tft.print("This meal has no ingredients.");
+        }
+    } else {
+        tft.setTextColor(calOrphan ? TFT_ORANGE : TFT_DARKGREY, TFT_BLACK);
+        tft.print(calOrphan ? "Assigned meal was deleted." : "Choose a meal with the arrows.");
+    }
+
+    // Save / Cancel (same positions as the other edit screens)
+    tft.fillRoundRect(saveItemBtn.x, saveItemBtn.y, saveItemBtn.w, saveItemBtn.h, 8, TFT_DARKGREEN);
+    tft.drawRoundRect(saveItemBtn.x, saveItemBtn.y, saveItemBtn.w, saveItemBtn.h, 8, TFT_WHITE);
+    tft.setTextColor(TFT_WHITE, TFT_DARKGREEN);
+    tft.setTextSize(2);
+    tft.setCursor(saveItemBtn.x + 45, saveItemBtn.y + 12);
+    tft.print("Save");
+
+    tft.fillRoundRect(cancelItemBtn.x, cancelItemBtn.y, cancelItemBtn.w, cancelItemBtn.h, 8, TFT_MAROON);
+    tft.drawRoundRect(cancelItemBtn.x, cancelItemBtn.y, cancelItemBtn.w, cancelItemBtn.h, 8, TFT_WHITE);
+    tft.setTextColor(TFT_WHITE, TFT_MAROON);
+    tft.setCursor(cancelItemBtn.x + 35, cancelItemBtn.y + 12);
+    tft.print("Cancel");
 }
 
 
@@ -285,69 +676,195 @@ void drawDashboard()
 
     tft.drawFastHLine(15, HEADER_H + 34, SCREEN_W - 30, TFT_DARKGREY);
 
-    if (groceryManager.getItemCount() == 0) {
+    int itemCount = groceryManager.getItemCount();
+    int totalPages = (itemCount + DASHBOARD_ITEMS_PER_PAGE - 1) /
+                     DASHBOARD_ITEMS_PER_PAGE;
+    if (totalPages < 1) totalPages = 1;
+
+    // Clamp the page if items were deleted or otherwise removed.
+    if (dashboardPageIndex >= totalPages) dashboardPageIndex = totalPages - 1;
+    if (dashboardPageIndex < 0) dashboardPageIndex = 0;
+
+    int startIndex = dashboardPageIndex * DASHBOARD_ITEMS_PER_PAGE;
+    int endIndex = startIndex + DASHBOARD_ITEMS_PER_PAGE;
+    if (endIndex > itemCount) endIndex = itemCount;
+
+    if (itemCount == 0) {
         tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
         tft.setCursor(20, HEADER_H + 60);
         tft.print("No items yet. Use the menu to add one.");
-        return;
-    }
+    } else {
+        int rowY = HEADER_H + 44;
+        int rowH = 28;
 
-    int rowY = HEADER_H + 44;
-    int rowH = 28;
+        // Only draw the items belonging to the current page.
+        for (int i = startIndex;
+             i < endIndex && rowY + rowH < dashboardPrevPageBtn.y - 10;
+             i++) {
 
-    for (int i = 0; i < groceryManager.getItemCount() && rowY + rowH < SCREEN_H; i++) {
-        int daysLeft = groceryManager.getDaysUntil(groceryManager.getItems()[i].spoilDate);
-        
-        dashboardItemButtons[i] = {10, rowY - 2, SCREEN_W - 20, rowH + 4, ""};
+            int row = i - startIndex;
+            dashboardItemButtons[row] =
+                {10, rowY - 2, SCREEN_W - 20, rowH + 4, ""};
 
-        tft.fillCircle(28, rowY + (rowH / 2), 6, daysColor(daysLeft, groceryManager.getItems()[i].spoiled));
+            int daysLeft =
+                groceryManager.getDaysUntil(groceryManager.getItems()[i].spoilDate);
 
-        tft.setTextColor(TFT_WHITE, TFT_BLACK);
-        tft.setTextSize(2);
-        
-        char nameBuf[64];
-        if (groceryManager.getItems()[i].qty > 1) {
-            sprintf(nameBuf, "%s (x%d)", groceryManager.getItems()[i].name, groceryManager.getItems()[i].qty);
-        } else {
-            strcpy(nameBuf, groceryManager.getItems()[i].name);
-        }
-        tft.setCursor(45, rowY + 3);
-        tft.print(nameBuf);
+            tft.fillCircle(
+                28, rowY + (rowH / 2), 6,
+                daysColor(daysLeft, groceryManager.getItems()[i].spoiled)
+            );
 
-        tft.setCursor(280, rowY + 3);
-        tft.print(categoryNames[groceryManager.getItems()[i].category]);
+            tft.setTextColor(TFT_WHITE, TFT_BLACK);
+            tft.setTextSize(2);
 
-        tft.setCursor(410, rowY + 3);
-        if (groceryManager.getItems()[i].spoiled) {
-            tft.setTextColor(TFT_RED, TFT_BLACK);
-            tft.print("OLD");
-        } else {
+            char nameBuf[64];
+            if (groceryManager.getItems()[i].qty > 1) {
+                snprintf(
+                    nameBuf, sizeof(nameBuf), "%s (x%d)",
+                    groceryManager.getItems()[i].name,
+                    groceryManager.getItems()[i].qty
+                );
+            } else {
+                strncpy(
+                    nameBuf,
+                    groceryManager.getItems()[i].name,
+                    sizeof(nameBuf) - 1
+                );
+                nameBuf[sizeof(nameBuf) - 1] = '\0';
+            }
+
+            char displayBuf[25];
+            int nameLen = strlen(nameBuf);
+
+            if (nameLen > 24) {
+                // Add trailing spaces so the end and start don't collide.
+                char paddedName[80];
+                snprintf(
+                    paddedName, sizeof(paddedName), "%s    ", nameBuf
+                );
+                int paddedLen = strlen(paddedName);
+
+                // Advance one character every 7000 ms. Scroll. Character wrap around.
+                int offset = (millis() / 7000) % paddedLen;
+
+                for (int c = 0; c < 24; c++) {
+                    displayBuf[c] = paddedName[(offset + c) % paddedLen];
+                }
+                displayBuf[24] = '\0';
+            } else {
+                strncpy(displayBuf, nameBuf, sizeof(displayBuf));
+                displayBuf[24] = '\0';
+            }
+
+            tft.setCursor(45, rowY + 3);
+            tft.print(displayBuf);
+
+            tft.setCursor(280, rowY + 3);
+            tft.setTextColor(TFT_WHITE, TFT_BLACK);
+            tft.print(categoryNames[groceryManager.getItems()[i].category]);
+
+            tft.setCursor(410, rowY + 3);
+            if (groceryManager.getItems()[i].spoiled) {
+                tft.setTextColor(TFT_RED, TFT_BLACK);
+            } else {
+                tft.setTextColor(TFT_WHITE, TFT_BLACK);
+            }
             tft.print(daysLeft);
-        }
 
-        rowY += rowH;
+            rowY += rowH;
+        }
     }
-    
+
+    // --- Pagination: "< pg# >" bottom-right, matching the Meals screen ---
+    bool hasPrev = dashboardPageIndex > 0;
+    bool hasNext = dashboardPageIndex < totalPages - 1;
+
+    tft.fillRoundRect(
+        dashboardPrevPageBtn.x, dashboardPrevPageBtn.y,
+        dashboardPrevPageBtn.w, dashboardPrevPageBtn.h, 8,
+        hasPrev ? TFT_DARKCYAN : TFT_DARKGREY
+    );
+    tft.drawRoundRect(
+        dashboardPrevPageBtn.x, dashboardPrevPageBtn.y,
+        dashboardPrevPageBtn.w, dashboardPrevPageBtn.h, 8, TFT_WHITE
+    );
+    tft.setTextColor(
+        hasPrev ? TFT_WHITE : TFT_LIGHTGREY,
+        hasPrev ? TFT_DARKCYAN : TFT_DARKGREY
+    );
+    tft.setTextSize(2);
+    tft.setCursor(
+        dashboardPrevPageBtn.x + 14,
+        dashboardPrevPageBtn.y + 12
+    );
+    tft.print(dashboardPrevPageBtn.label);
+
+    char pageLabel[16];
+    snprintf(
+        pageLabel, sizeof(pageLabel),
+        "%d/%d", dashboardPageIndex + 1, totalPages
+    );
+
+    int pageLabelX =
+        dashboardPrevPageBtn.x + dashboardPrevPageBtn.w +
+        ((dashboardNextPageBtn.x -
+          (dashboardPrevPageBtn.x + dashboardPrevPageBtn.w)) / 2) -
+        (strlen(pageLabel) * 6);
+
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setCursor(pageLabelX, dashboardPrevPageBtn.y + 12);
+    tft.print(pageLabel);
+
+    tft.fillRoundRect(
+        dashboardNextPageBtn.x, dashboardNextPageBtn.y,
+        dashboardNextPageBtn.w, dashboardNextPageBtn.h, 8,
+        hasNext ? TFT_DARKCYAN : TFT_DARKGREY
+    );
+    tft.drawRoundRect(
+        dashboardNextPageBtn.x, dashboardNextPageBtn.y,
+        dashboardNextPageBtn.w, dashboardNextPageBtn.h, 8, TFT_WHITE
+    );
+    tft.setTextColor(
+        hasNext ? TFT_WHITE : TFT_LIGHTGREY,
+        hasNext ? TFT_DARKCYAN : TFT_DARKGREY
+    );
+    tft.setCursor(
+        dashboardNextPageBtn.x + 14,
+        dashboardNextPageBtn.y + 12
+    );
+    tft.print(dashboardNextPageBtn.label);
+
+    // Keep the existing Back UI call for consistency. On the Dashboard it
+    // is not normally visible/used, but this does not change its behavior.
+    // drawBackButtonUI();
+
+    // Existing item context popup is still drawn on top of the current page.
     if (itemMenuPopupOpen) {
         int menuW = 160;
         int menuH = 135;
         int px = itemMenuX;
         int py = itemMenuY;
-        
+
         if (px + menuW > SCREEN_W) px = SCREEN_W - menuW - 10;
         if (py + menuH > SCREEN_H) py = SCREEN_H - menuH - 10;
-        
+
         tft.fillRoundRect(px, py, menuW, menuH, 8, TFT_DARKGREY);
         tft.drawRoundRect(px, py, menuW, menuH, 8, TFT_WHITE);
-        
+
         ctxAddBtn = {px + 10, py + 10, 140, 33, "Edit Item"};
         ctxRefreshBtn = {px + 10, py + 50, 140, 33, "Refresh"};
         ctxDeleteBtn = {px + 10, py + 90, 140, 33, "Delete"};
-        
+
         Button* btns[] = {&ctxAddBtn, &ctxRefreshBtn, &ctxDeleteBtn};
-        for(int k=0; k<3; k++) {
-            tft.fillRoundRect(btns[k]->x, btns[k]->y, btns[k]->w, btns[k]->h, 5, TFT_DARKCYAN);
-            tft.drawRoundRect(btns[k]->x, btns[k]->y, btns[k]->w, btns[k]->h, 5, TFT_WHITE);
+        for (int k = 0; k < 3; k++) {
+            tft.fillRoundRect(
+                btns[k]->x, btns[k]->y,
+                btns[k]->w, btns[k]->h, 5, TFT_DARKCYAN
+            );
+            tft.drawRoundRect(
+                btns[k]->x, btns[k]->y,
+                btns[k]->w, btns[k]->h, 5, TFT_WHITE
+            );
             tft.setTextColor(TFT_WHITE, TFT_DARKCYAN);
             tft.setTextSize(2);
             tft.setCursor(btns[k]->x + 10, btns[k]->y + 8);
@@ -409,6 +926,14 @@ void closeMenu()
         case SCREEN_ADD_ITEM: 
             // Redraws add item screen to clear any temporary state drawn while building it.
             drawAddItemScreen(); 
+            break;
+
+        case SCREEN_CALENDAR:
+            drawCalendarScreen();
+            break;
+
+        case SCREEN_CALENDAR_DAY:
+            drawCalendarDayScreen();
             break;
 
         case SCREEN_WIFI_SETTINGS:
@@ -836,6 +1361,15 @@ void handleTouch(int x, int y)
         return;
     }
 
+    if (hitTest(wifiIconButton, x, y)) 
+    {
+        itemMenuPopupOpen = false;
+        if (menuOpen) closeMenu();
+        currentScreen = SCREEN_WIFI_SETTINGS;
+        drawWifiSettingsScreen();
+        return;
+    }
+
     // --- 4. MENU OVERLAY HANDLING ---
     if (menuOpen) 
     {
@@ -858,9 +1392,13 @@ void handleTouch(int x, int y)
             return;
         } else if (hitTest(menuButtons[2], x, y)) 
         {
-            currentScreen = SCREEN_FETCH_UPDATES;
+            int todayY, todayM, todayD;
+            calGetToday(todayY, todayM, todayD);
+            calViewYear = todayY;
+            calViewMonth = todayM;
+            currentScreen = SCREEN_CALENDAR;
             menuOpen = false;
-            drawPlaceholderScreen("Fetch Updates");
+            drawCalendarScreen();
             return;
         } else if (hitTest(menuButtons[3], x, y)) 
         {
@@ -879,47 +1417,100 @@ void handleTouch(int x, int y)
 
         case SCREEN_DASHBOARD:
             if (wasTouched) return; // Ignore drag motions on dashboard
-            if (itemMenuPopupOpen) 
+
+            // Pagination controls must be checked before item rows.
+            if (hitTest(dashboardPrevPageBtn, x, y)) {
+                if (dashboardPageIndex > 0) {
+                    dashboardPageIndex--;
+                    itemMenuPopupOpen = false;
+                    selectedItemIndex = -1;
+                    drawDashboard();
+                }
+                return;
+            }
+
+            if (hitTest(dashboardNextPageBtn, x, y)) {
+                int itemCount = groceryManager.getItemCount();
+                int totalPages =
+                    (itemCount + DASHBOARD_ITEMS_PER_PAGE - 1) /
+                    DASHBOARD_ITEMS_PER_PAGE;
+                if (totalPages < 1) totalPages = 1;
+
+                if (dashboardPageIndex < totalPages - 1) {
+                    dashboardPageIndex++;
+                    itemMenuPopupOpen = false;
+                    selectedItemIndex = -1;
+                    drawDashboard();
+                }
+                return;
+            }
+
+            if (itemMenuPopupOpen)
             {
-                if (hitTest(ctxAddBtn, x, y)) 
+                if (hitTest(ctxAddBtn, x, y))
                 {
-                    strncpy(newItemName, groceryManager.getItems()[selectedItemIndex].name, NAME_MAX_LEN);
-                    newItemCategory = groceryManager.getItems()[selectedItemIndex].category;
-                    newItemDays = (groceryManager.getItems()[selectedItemIndex].spoilDate - groceryManager.getItems()[selectedItemIndex].dateAdded) / (24*3600);
+                    strncpy(
+                        newItemName,
+                        groceryManager.getItems()[selectedItemIndex].name,
+                        NAME_MAX_LEN
+                    );
+                    newItemCategory =
+                        groceryManager.getItems()[selectedItemIndex].category;
+                    newItemDays =
+                        (groceryManager.getItems()[selectedItemIndex].spoilDate -
+                         groceryManager.getItems()[selectedItemIndex].dateAdded) /
+                        (24 * 3600);
                     if (newItemDays <= 0) newItemDays = 7;
-                    newItemQty = groceryManager.getItems()[selectedItemIndex].qty;
+                    newItemQty =
+                        groceryManager.getItems()[selectedItemIndex].qty;
                     editingItemIndex = selectedItemIndex;
                     itemMenuPopupOpen = false;
                     currentScreen = SCREEN_ADD_ITEM;
                     drawAddItemScreen();
-                } else if (hitTest(ctxRefreshBtn, x, y)) 
+                }
+                else if (hitTest(ctxRefreshBtn, x, y))
                 {
                     time_t now = time(nullptr);
-                    time_t originalDuration = groceryManager.getItems()[selectedItemIndex].spoilDate - groceryManager.getItems()[selectedItemIndex].dateAdded;
+                    time_t originalDuration =
+                        groceryManager.getItems()[selectedItemIndex].spoilDate -
+                        groceryManager.getItems()[selectedItemIndex].dateAdded;
                     groceryManager.getItems()[selectedItemIndex].dateAdded = now;
-                    groceryManager.getItems()[selectedItemIndex].spoilDate = now + originalDuration;
+                    groceryManager.getItems()[selectedItemIndex].spoilDate =
+                        now + originalDuration;
                     groceryManager.getItems()[selectedItemIndex].spoiled = false;
                     groceryManager.saveItems();
                     itemMenuPopupOpen = false;
                     drawDashboard();
-                } else if (hitTest(ctxDeleteBtn, x, y)) 
+                }
+                else if (hitTest(ctxDeleteBtn, x, y))
                 {
                     groceryManager.deleteItem(selectedItemIndex);
                     itemMenuPopupOpen = false;
                     selectedItemIndex = -1;
                     drawDashboard();
-                } else 
+                }
+                else
                 {
                     itemMenuPopupOpen = false;
                     drawDashboard();
                 }
-            } else 
+            }
+            else
             {
-                for (int i = 0; i < groceryManager.getItemCount(); i++) 
+                int startIndex =
+                    dashboardPageIndex * DASHBOARD_ITEMS_PER_PAGE;
+                int endIndex =
+                    startIndex + DASHBOARD_ITEMS_PER_PAGE;
+                if (endIndex > groceryManager.getItemCount()) {
+                    endIndex = groceryManager.getItemCount();
+                }
+
+                for (int i = startIndex; i < endIndex; i++)
                 {
-                    if (hitTest(dashboardItemButtons[i], x, y)) 
+                    int row = i - startIndex;
+                    if (hitTest(dashboardItemButtons[row], x, y))
                     {
-                        selectedItemIndex = i;
+                        selectedItemIndex = i; // Keep absolute inventory index.
                         itemMenuPopupOpen = true;
                         itemMenuX = x;
                         itemMenuY = y;
@@ -987,8 +1578,109 @@ void handleTouch(int x, int y)
             }
             break;
 
+        case SCREEN_CALENDAR:
+        {
+            if (wasTouched) return;
+
+            if (hitTest(calPrevBtn, x, y))
+            {
+                if (--calViewMonth < 0) { calViewMonth = 11; calViewYear--; }
+                drawCalendarScreen();
+                return;
+            }
+
+            if (hitTest(calNextBtn, x, y))
+            {
+                if (++calViewMonth > 11) { calViewMonth = 0; calViewYear++; }
+                drawCalendarScreen();
+                return;
+            }
+
+            int col = (x - CAL_GRID_X) / CAL_CELL_W;
+            int row = (y - CAL_GRID_Y) / CAL_CELL_H;
+
+            if (x >= CAL_GRID_X && y >= CAL_GRID_Y && col >= 0 && col < 7 && row >= 0 && row < 6)
+            {
+                int day = row * 7 + col - calDayOfWeek(calViewYear, calViewMonth, 1) + 1;
+
+                if (day >= 1 && day <= calDaysInMonth(calViewYear, calViewMonth))
+                {
+                    calOpenDay(calViewYear, calViewMonth, day);
+                    currentScreen = SCREEN_CALENDAR_DAY;
+                    drawCalendarDayScreen();
+                }
+            }
+            return;
+        }
+
+        case SCREEN_CALENDAR_DAY:
+        {
+            // Drag-scroll the ingredient list
+            if (y >= CAL_DAY_LIST_TOP && y <= CAL_DAY_LIST_BOTTOM &&
+                wasTouched && (deltaY > 2 || deltaY < -2) && calPickedMeal >= 0)
+            {
+                mealScrollOffset += deltaY;
+
+                const MealItem &meal = mealsManager.getMeals()[calPickedMeal];
+                int contentHeight = meal.ingredientCount * CAL_DAY_ROW_H;
+                int maxOff = contentHeight - (CAL_DAY_LIST_BOTTOM - CAL_DAY_LIST_TOP);
+                if (maxOff < 0) maxOff = 0;
+
+                if (mealScrollOffset < 0) mealScrollOffset = 0;
+                if (mealScrollOffset > maxOff) mealScrollOffset = maxOff;
+
+                drawCalendarDayScreen();
+                return;
+            }
+
+            if (wasTouched) return;
+
+            int mealCount = mealsManager.getMealCount();
+
+            if (hitTest(calMealPrevBtn, x, y))
+            {
+                if (mealCount > 0) {
+                    if (--calPickedMeal < -1) calPickedMeal = mealCount - 1;
+                    mealScrollOffset = 0;
+                    drawCalendarDayScreen();
+                }
+                return;
+            }
+
+            if (hitTest(calMealNextBtn, x, y))
+            {
+                if (mealCount > 0) {
+                    if (++calPickedMeal >= mealCount) calPickedMeal = -1;
+                    mealScrollOffset = 0;
+                    drawCalendarDayScreen();
+                }
+                return;
+            }
+
+            if (hitTest(saveItemBtn, x, y))
+            {
+                // "No meal" selected clears the day
+                const char *name = (calPickedMeal >= 0)
+                    ? mealsManager.getMeals()[calPickedMeal].name : "";
+                calAssign(calSelYear, calSelMonth, calSelDay, name);
+
+                mealScrollOffset = 0;
+                currentScreen = SCREEN_CALENDAR;
+                drawCalendarScreen();
+                return;
+            }
+
+            if (hitTest(cancelItemBtn, x, y))
+            {
+                mealScrollOffset = 0;
+                currentScreen = SCREEN_CALENDAR;
+                drawCalendarScreen();
+                return;
+            }
+            return;
+        }
+
         case SCREEN_EDIT_STOCK:
-        case SCREEN_FETCH_UPDATES:
             if (wasTouched) return;
             if (hitTest(backButton, x, y)) 
             {
@@ -1019,15 +1711,43 @@ void handleTouch(int x, int y)
                 return;
             }
 
-            for (int i = 0; i < mealsManager.getMealCount(); i++)
+            if (hitTest(mealsPrevPageBtn, x, y))
             {
-                if (hitTest(mealListButtons[i], x, y))
+                if (mealsPageIndex > 0) {
+                    mealsPageIndex--;
+                    drawMealsScreen();
+                }
+                return;
+            }
+
+            if (hitTest(mealsNextPageBtn, x, y))
+            {
+                int mealCount = mealsManager.getMealCount();
+                int totalPages = (mealCount + MEALS_PER_PAGE - 1) / MEALS_PER_PAGE;
+                if (totalPages < 1) totalPages = 1;
+                if (mealsPageIndex < totalPages - 1) {
+                    mealsPageIndex++;
+                    drawMealsScreen();
+                }
+                return;
+            }
+
+            {
+                int startIndex = mealsPageIndex * MEALS_PER_PAGE;
+                int endIndex = startIndex + MEALS_PER_PAGE;
+                if (endIndex > mealsManager.getMealCount()) endIndex = mealsManager.getMealCount();
+
+                for (int i = startIndex; i < endIndex; i++)
                 {
-                    selectedMealIndex = i;
-                    mealScrollOffset = 0;
-                    currentScreen = SCREEN_MEAL_DETAILS;
-                    drawMealDetailsScreen();
-                    return;
+                    int row = i - startIndex;
+                    if (hitTest(mealListButtons[row], x, y))
+                    {
+                        selectedMealIndex = i;
+                        mealScrollOffset = 0;
+                        currentScreen = SCREEN_MEAL_DETAILS;
+                        drawMealDetailsScreen();
+                        return;
+                    }
                 }
             }
 
@@ -1145,6 +1865,13 @@ void handleTouch(int x, int y)
                 const MealItem &m = mealsManager.getMeals()[selectedMealIndex];
                 mealsManager.addToMealCount(selectedMealIndex, -1);
                 drawMealDetailsScreen();
+            } else if (hitTest(mealDeleteBtn, x, y)) 
+            {
+                const MealItem &m = mealsManager.getMeals()[selectedMealIndex];
+                mealsManager.deleteMeal(selectedMealIndex);
+                currentScreen = SCREEN_MEALS;
+                drawMealsScreen();
+
             } else if (hitTest(backButton, x, y)) 
             {
                 currentScreen = SCREEN_MEALS;
@@ -1306,6 +2033,23 @@ void setup()
     Serial.println("====================================");
     Serial.println("MaTouch Lite - Fridge Stock App");
     Serial.println("====================================");
+
+#ifdef CLEAR_FLASH_ON_BOOT
+    Serial.println("!!! CLEAR_FLASH_ON_BOOT defined: Formatting LittleFS... !!!");
+    
+    // Mount LittleFS first; if it fails, pass true to auto-format
+    if (!LittleFS.begin(true)) {
+        Serial.println("LittleFS mount failed, auto-formatted!");
+    } else {
+        Serial.println("LittleFS mounted. Formatting now...");
+        LittleFS.format();
+        Serial.println("Format complete!");
+    }
+
+    Serial.println("!!! Flash cleared. Remove build flag and reflash. !!!");
+    while (1) { delay(1000); } // Halt execution
+#endif
+
     pinMode(TFT_BL, OUTPUT);
     digitalWrite(TFT_BL, HIGH);
     Serial.println("Initializing LCD...");
@@ -1320,6 +2064,7 @@ void setup()
     Serial.println("Mounting LittleFS...");
     groceryManager.begin();
     mealsManager.begin();
+    calLoad();
     networkManager.loadLastSyncEpoch();
     groceryManager.checkSpoilage();
     lastSpoilCheckMillis = millis();
@@ -1346,6 +2091,17 @@ void loop()
         }
     }
 
+    // Start API server once connected to WiFi
+    if (networkManager.getWifiState() == WIFI_STATE_CONNECTED) {
+        if (!apiServerStarted) {
+            apiServer.begin();
+            apiServerStarted = true;
+        }
+        apiServer.handle();
+    } else {
+        apiServerStarted = false;
+    }
+
     touch.Scan();
     if (touch.Touched) {
         int rawX = touch.X;
@@ -1360,6 +2116,12 @@ void loop()
         wasTouched = true;
     } else {
         wasTouched = false;
+    }
+
+    // --- PERIODIC SCREEN REFRESH ---
+    if (millis() - lastScreenRefreshMillis >= SCREEN_REFRESH_INTERVAL_MS) {
+        refreshCurrentScreen();
+        lastScreenRefreshMillis = millis();
     }
 
     if (millis() - lastSpoilCheckMillis >= SPOIL_CHECK_INTERVAL_MS) {
@@ -1397,15 +2159,31 @@ void drawMealsScreen()
     int rowY = addMealNavBtn.y + addMealNavBtn.h + 15;
     int rowH = 35;
 
-    if (mealsManager.getMealCount() == 0) {
+    int mealCount = mealsManager.getMealCount();
+    int totalPages = (mealCount + MEALS_PER_PAGE - 1) / MEALS_PER_PAGE;
+    if (totalPages < 1) totalPages = 1;
+
+    // Clamp in case the count shrank (e.g. a meal was deleted) since the
+    // page was last set.
+    if (mealsPageIndex >= totalPages) mealsPageIndex = totalPages - 1;
+    if (mealsPageIndex < 0) mealsPageIndex = 0;
+
+    int startIndex = mealsPageIndex * MEALS_PER_PAGE;
+
+    if (mealCount == 0) {
         tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
         tft.setCursor(20, rowY);
         tft.print("No meals yet.");
     }
 
-    // Stop drawing rows well clear of the Back button
-    for (int i = 0; i < mealsManager.getMealCount() && rowY + rowH < backButton.y - 10; i++) {
-        mealListButtons[i] = {20, rowY, 440, rowH, ""};
+    // Only draw this page's slice (up to MEALS_PER_PAGE meals), still
+    // staying clear of the Back button.
+    int endIndex = startIndex + MEALS_PER_PAGE;
+    if (endIndex > mealCount) endIndex = mealCount;
+
+    for (int i = startIndex; i < endIndex && rowY + rowH < backButton.y - 10; i++) {
+        int row = i - startIndex;
+        mealListButtons[row] = {20, rowY, 440, rowH, ""};
         const MealItem &m = mealsManager.getMeals()[i];
 
         tft.fillRoundRect(20, rowY, 440, rowH, 5, TFT_DARKCYAN);
@@ -1420,6 +2198,33 @@ void drawMealsScreen()
 
         rowY += rowH + 5;
     }
+
+    // --- Pagination: "< pg# >" bottom-right, in-line with the Back button ---
+    bool hasPrev = mealsPageIndex > 0;
+    bool hasNext = mealsPageIndex < totalPages - 1;
+
+    tft.fillRoundRect(mealsPrevPageBtn.x, mealsPrevPageBtn.y, mealsPrevPageBtn.w, mealsPrevPageBtn.h, 8,
+                       hasPrev ? TFT_DARKCYAN : TFT_DARKGREY);
+    tft.drawRoundRect(mealsPrevPageBtn.x, mealsPrevPageBtn.y, mealsPrevPageBtn.w, mealsPrevPageBtn.h, 8, TFT_WHITE);
+    tft.setTextColor(hasPrev ? TFT_WHITE : TFT_LIGHTGREY, hasPrev ? TFT_DARKCYAN : TFT_DARKGREY);
+    tft.setTextSize(2);
+    tft.setCursor(mealsPrevPageBtn.x + 14, mealsPrevPageBtn.y + 12);
+    tft.print(mealsPrevPageBtn.label);
+
+    char pageLabel[16];
+    snprintf(pageLabel, sizeof(pageLabel), "%d/%d", mealsPageIndex + 1, totalPages);
+    int pageLabelX = mealsPrevPageBtn.x + mealsPrevPageBtn.w +
+        ((mealsNextPageBtn.x - (mealsPrevPageBtn.x + mealsPrevPageBtn.w)) / 2) - (strlen(pageLabel) * 6);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setCursor(pageLabelX, mealsPrevPageBtn.y + 12);
+    tft.print(pageLabel);
+
+    tft.fillRoundRect(mealsNextPageBtn.x, mealsNextPageBtn.y, mealsNextPageBtn.w, mealsNextPageBtn.h, 8,
+                       hasNext ? TFT_DARKCYAN : TFT_DARKGREY);
+    tft.drawRoundRect(mealsNextPageBtn.x, mealsNextPageBtn.y, mealsNextPageBtn.w, mealsNextPageBtn.h, 8, TFT_WHITE);
+    tft.setTextColor(hasNext ? TFT_WHITE : TFT_LIGHTGREY, hasNext ? TFT_DARKCYAN : TFT_DARKGREY);
+    tft.setCursor(mealsNextPageBtn.x + 14, mealsNextPageBtn.y + 12);
+    tft.print(mealsNextPageBtn.label);
 
     drawBackButtonUI();
 }
@@ -1480,6 +2285,12 @@ void drawMealDetailsScreen()
     tft.setTextColor(TFT_WHITE, TFT_MAROON);
     tft.setCursor(mealMinusBtn.x + 8, mealMinusBtn.y + 8);
     tft.print(mealMinusBtn.label);
+
+    tft.fillRoundRect(mealDeleteBtn.x, mealDeleteBtn.y, mealDeleteBtn.w, mealDeleteBtn.h, 8, TFT_MAROON);
+    tft.drawRoundRect(mealDeleteBtn.x, mealDeleteBtn.y, mealDeleteBtn.w, mealDeleteBtn.h, 8, TFT_WHITE);
+    tft.setTextColor(TFT_WHITE, TFT_MAROON);
+    tft.setCursor(mealDeleteBtn.x + 18, mealDeleteBtn.y + 10);
+    tft.print(mealDeleteBtn.label);
 
     drawBackButtonUI();
 }
@@ -1643,4 +2454,49 @@ void drawHomeButton()
     tft.setCursor(centerX, centerY);
     tft.print("H");
     tft.setTextSize(2);
+}
+
+void refreshCurrentScreen()
+{
+    // Skip auto-refresh if menu/popups are active, keyboard is open, or screen is currently touched
+    if (wasTouched || menuOpen || itemMenuPopupOpen || currentScreen == SCREEN_KEYBOARD) {
+        return;
+    }
+
+    switch (currentScreen) {
+        case SCREEN_DASHBOARD:
+            drawDashboard();
+            break;
+
+        case SCREEN_MEALS:
+            drawMealsScreen();
+            break;
+
+        case SCREEN_MEAL_DETAILS:
+            drawMealDetailsScreen();
+            break;
+
+        case SCREEN_CALENDAR:
+            drawCalendarScreen();
+            break;
+
+        case SCREEN_CALENDAR_DAY:
+            drawCalendarDayScreen();
+            break;
+
+        case SCREEN_WIFI_SETTINGS:
+            drawWifiSettingsScreen();
+            break;
+
+        case SCREEN_ADD_ITEM:
+            drawAddItemScreen();
+            break;
+
+        case SCREEN_ADD_MEAL:
+            drawAddMealScreen();
+            break;
+
+        default:
+            break;
+    }
 }

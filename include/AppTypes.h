@@ -5,7 +5,7 @@
 
 #define SCREEN_W 480
 #define SCREEN_H 320
-#define NAME_MAX_LEN 24
+#define NAME_MAX_LEN 32
 #define MAX_ITEMS 100
 
 enum WifiState {
@@ -26,7 +26,9 @@ enum AppScreen {
     SCREEN_WIFI_SETTINGS,
     SCREEN_WIFI_SCAN_LIST,
     SCREEN_MEAL_DETAILS,
-    SCREEN_ADD_MEAL
+    SCREEN_ADD_MEAL,
+    SCREEN_CALENDAR,
+    SCREEN_CALENDAR_DAY
 };
 
 enum KeyboardTarget {
